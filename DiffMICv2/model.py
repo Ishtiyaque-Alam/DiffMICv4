@@ -226,7 +226,9 @@ class SamEncoder(nn.Module):
 
     def forward_feature(self, x):
         with torch.no_grad():
-            feature = self.f.image_encoder(x)
+            # EfficientSAM expects 1024x1024 input
+            x_resized = F.interpolate(x, size=(1024, 1024), mode='bilinear', align_corners=False)
+            feature = self.f.image_encoder(x_resized)
         feature = self.g(feature)
         feature = F.adaptive_avg_pool2d(feature,(1,1))
         return torch.flatten(feature,start_dim=1)
