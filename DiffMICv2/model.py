@@ -216,7 +216,7 @@ class SamEncoder(nn.Module):
 
         self.f = []
         self.f = build_efficient_sam_vits()
-        self.featdim = 384
+        self.featdim = 256  # EfficientSAM image_encoder output channels (not patch_embed_dim)
 
         # Freeze EfficientSAM-ViT-S weights (E-BayesSAM style)
         for param in self.f.parameters():
