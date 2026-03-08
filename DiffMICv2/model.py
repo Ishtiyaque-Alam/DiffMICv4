@@ -226,7 +226,7 @@ class SamEncoder(nn.Module):
 
     def forward_feature(self, x):
         with torch.no_grad():
-            feature = self.f(x)
+            feature = self.f.image_encoder(x)
         feature = self.g(feature)
         feature = F.adaptive_avg_pool2d(feature,(1,1))
         return torch.flatten(feature,start_dim=1)
