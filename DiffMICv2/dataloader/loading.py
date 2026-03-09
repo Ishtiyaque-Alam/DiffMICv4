@@ -314,6 +314,9 @@ class HAM10000Dataset(Dataset):
 
         if train:
             selected_indices = indices[:split_idx]
+            # Limit training set to 5000 images
+            if len(selected_indices) > 5000:
+                selected_indices = selected_indices[:5000]
         else:
             selected_indices = indices[split_idx:]
 
