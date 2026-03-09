@@ -282,14 +282,14 @@ def main():
     )
     lr_monitor_callback = LearningRateMonitor(logging_interval='step')
     trainer = pl.Trainer(
-        check_val_every_n_epoch=30,
+        check_val_every_n_epoch=
         num_sanity_val_steps=0,
         max_epochs=config.training.n_epochs,
         accelerator='gpu',
-        devices=1,
+        devices=2,
         precision=32,
         logger=logger,
-        strategy="auto",
+        strategy=DDPStrategy(find_unused_parameters=True),
         enable_progress_bar=False,
         log_every_n_steps=5,
         callbacks=[checkpoint_callback, lr_monitor_callback]

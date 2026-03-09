@@ -41,8 +41,8 @@ diffusion:
         logging_interval: 1
 
 training:
-    batch_size: 8
-    n_epochs: 30
+    batch_size: 16
+    n_epochs: 50
     warmup_epochs: 5
     add_t0_loss: False
     n_steps_req_grad: 100
