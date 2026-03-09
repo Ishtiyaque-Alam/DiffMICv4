@@ -282,7 +282,7 @@ def main():
     )
     lr_monitor_callback = LearningRateMonitor(logging_interval='step')
     trainer = pl.Trainer(
-        check_val_every_n_epoch=
+        check_val_every_n_epoch=10,
         num_sanity_val_steps=0,
         max_epochs=config.training.n_epochs,
         accelerator='gpu',
