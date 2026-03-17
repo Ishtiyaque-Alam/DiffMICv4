@@ -180,7 +180,7 @@ def main():
         return
 
     # Determine epochs
-    n_epochs = args.epochs if args.epochs is not None else config.diffusion.aux_cls.n_pretrain_epochs
+    n_epochs = args.epochs if args.epochs is not None else config.aux_cls.n_pretrain_epochs
     print(f"\nPretraining DCG for {n_epochs} epochs on {config.data.dataset}")
 
     # Get dataset

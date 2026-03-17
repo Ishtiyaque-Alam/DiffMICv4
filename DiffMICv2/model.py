@@ -90,7 +90,7 @@ class DenoiseUNet(nn.Module):
 class ConditionalModel(nn.Module):
     def __init__(self, config, guidance=True):
         super(ConditionalModel, self).__init__()
-        n_steps = config.diffusion.timesteps + 1
+        n_steps = getattr(getattr(config, "flow_matching", None), "num_steps", 1) + 1
         data_dim = config.model.data_dim
         y_dim = config.data.num_classes
         arch = config.model.arch

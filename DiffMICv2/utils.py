@@ -117,15 +117,13 @@ def get_dataset(config):
         train_dataset = HAM10000Dataset(
             data_dir=config.data.data_dir,
             csv_path=config.data.traindata,
-            train=True,
-            split_ratio=0.8,
+            split='train',
             seed=config.data.seed
         )
         test_dataset = HAM10000Dataset(
             data_dir=config.data.data_dir,
             csv_path=config.data.testdata,
-            train=False,
-            split_ratio=0.8,
+            split='test',
             seed=config.data.seed
         )
     else:

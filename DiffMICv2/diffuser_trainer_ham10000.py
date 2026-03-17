@@ -45,7 +45,6 @@ from pytorch_lightning.loggers import TensorBoardLogger
 from argparse import Namespace
 
 from torch.utils.data import DataLoader
-import pipeline
 
 from torchvision.utils import save_image
 from torchvision.models import vgg16
@@ -56,6 +55,8 @@ import math
 from pretraining.dcg import DCG as AuxCls
 from model import *
 from utils import *
+from rectified_flow import RectifiedFlow
+from rectified_flow.flow_components.interpolation_solver import AffineInterp
 
 
 class CoolSystem(pl.LightningModule):
@@ -67,14 +68,33 @@ class CoolSystem(pl.LightningModule):
         self.epochs = self.params.training.n_epochs
         self.initlr = self.params.optim.lr
 
-        
-        config_path = r'option/diff_DDIM.yaml'
-        with open(config_path, 'r') as f:
-            params = yaml.safe_load(f)
-        config = EasyDict(params)
-        self.diff_opt = config
+        feature_dim = self.params.model.feature_dim
+        num_classes = self.params.data.num_classes
 
-        self.model = ConditionalModel(self.params, guidance=self.params.diffusion.include_guidance)
+        self.feature_encoder = SamEncoder(arch=self.params.model.arch, feature_dim=feature_dim, config=self.params)
+        self.condition_proj = nn.Linear(num_classes * 2, feature_dim)
+        self.velocity_net = nn.Sequential(
+            nn.Linear(feature_dim + 1, feature_dim * 2),
+            nn.GELU(),
+            nn.LayerNorm(feature_dim * 2),
+            nn.Linear(feature_dim * 2, feature_dim)
+        )
+        orig_forward = self.velocity_net.forward
+        def conditioned_forward(x, t=None):
+            if t is None:
+                return orig_forward(x)
+            if t.dim() == 0:
+                t = t.expand(x.size(0))
+            if t.dim() == 1:
+                t = t.unsqueeze(-1)
+            return orig_forward(torch.cat([x, t], dim=-1))
+        self.velocity_net.forward = conditioned_forward
+        self.flow = RectifiedFlow(
+            data_shape=(feature_dim,),
+            velocity_field=self.velocity_net,
+            interp=AffineInterp('straight')
+        )
+        self.classifier = nn.Linear(feature_dim, num_classes)
         self.aux_model = AuxCls(self.params)
         self.init_weight(ckpt_path='/kaggle/input/datasets/deadlydracula/ham1000-dcg/ham10000_aux_model_epoch20.pth')
         self.aux_model.eval()
@@ -88,16 +108,13 @@ class CoolSystem(pl.LightningModule):
         self.gts = []
         self.preds = []
 
-        self.DiffSampler = pipeline.SR3Sampler(
-            model=self.model,
-            scheduler = pipeline.create_SR3scheduler(self.diff_opt['scheduler'], 'train'),
-        )
-        self.DiffSampler.scheduler.set_timesteps(self.diff_opt['scheduler']['num_test_timesteps'])
-        self.DiffSampler.scheduler.diff_chns = self.params.data.num_classes
-
     def configure_optimizers(self):
         # REQUIRED
-        optimizer = get_optimizer(self.params.optim, filter(lambda p: p.requires_grad, self.model.parameters()))
+        params = list(self.feature_encoder.parameters()) + \
+                 list(self.condition_proj.parameters()) + \
+                 list(self.velocity_net.parameters()) + \
+                 list(self.classifier.parameters())
+        optimizer = get_optimizer(self.params.optim, filter(lambda p: p.requires_grad, params))
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=self.epochs, eta_min=self.initlr * 0.01)
 
         return [optimizer], [scheduler]
@@ -119,66 +136,43 @@ class CoolSystem(pl.LightningModule):
         else:
             print(f"Warning: checkpoint not found at {ckpt_path}, using random init for aux_model")
 
-    def diffusion_focal_loss(self, prior, targets, noise, noise_gt, gamma=1, alpha=10):
-        probs = F.softmax(prior, dim=1)
-        probs = (probs * targets).sum(dim=1)
-        weights = 1+alpha*(1 - probs) ** gamma
-        weights = weights.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
-        loss = weights*(noise-noise_gt).square()
-        return loss.mean()
-
-
-
-    def guided_prob_map(self, y0_g, y0_l, bz, nc, np):
-    
-        distance_to_diag = torch.tensor([[abs(i-j)  for j in range(np)] for i in range(np)]).to(self.device)
-
-        weight_g = 1 - distance_to_diag / (np-1)
-        weight_l = distance_to_diag / (np-1)
-        interpolated_value = weight_l.unsqueeze(0).unsqueeze(0) * y0_l.unsqueeze(-1).unsqueeze(-1) + weight_g.unsqueeze(0).unsqueeze(0) * y0_g.unsqueeze(-1).unsqueeze(-1)
-        diag_indices = torch.arange(np)
-        map = interpolated_value.clone()
-        for i in range(bz):
-            for j in range(nc):
-                map[i,j,diag_indices,diag_indices] = y0_g[i,j]
-                map[i,j, np-1, 0] = y0_l[i,j]
-                map[i,j, 0, np-1] = y0_l[i,j]
-        return map
+    def _sample_flow(self, batch_size, device, num_steps):
+        x_t = self.flow.sample_source_distribution(batch_size).to(device)
+        t = torch.linspace(0.0, 1.0, num_steps + 1, device=device)
+        for i in range(num_steps):
+            t_i = t[i].expand(batch_size)
+            dt = t[i + 1] - t[i]
+            v_t = self.flow.get_velocity(x_t, t_i)
+            x_t = x_t + dt * v_t
+        return x_t
 
     def training_step(self, batch, batch_idx):
-        self.model.train()
+        self.feature_encoder.train()
         self.aux_model.eval()
         
         x_batch, y_batch = batch
-        y_batch, _ = cast_label_to_one_hot_and_prototype(y_batch, self.params)
-        y_batch = y_batch.cuda()
-        x_batch = x_batch.cuda()
+        labels = y_batch.to(self.device).long()
+        x_batch = x_batch.to(self.device)
         with torch.no_grad():
             y0_aux, y0_aux_global, y0_aux_local, patches, attns, attn_map = self.aux_model(x_batch)
         
         # attn_map is now (B, num_classes) from KAN head — no spatial dims
-        bz, nc = y0_aux_global.size()
-        bz, np = attns.size()
-        
-        y_map = y_batch.unsqueeze(1).expand(-1,np*np,-1).reshape(bz*np*np,nc)
-        noise = torch.randn_like(y_map).to(self.device)
-        timesteps = torch.randint(0, self.DiffSampler.scheduler.config.num_train_timesteps, (bz*np*np,), device=self.device).long()
+        features = self.feature_encoder(x_batch)
+        condition = self.condition_proj(torch.cat([y0_aux_global, y0_aux_local], dim=1))
+        x0 = features + condition
 
-        noisy_y = self.DiffSampler.scheduler.add_noise(y_map, timesteps=timesteps, noise=noise)
-        noisy_y = noisy_y.view(bz,np*np,-1).permute(0,2,1).reshape(bz,nc,np,np)
-        
-        y0_cond = self.guided_prob_map(y0_aux_global,y0_aux_local,bz,nc,np)
-        y_fusion = torch.cat([y0_cond, noisy_y],dim=1)
+        flow_loss = self.flow.get_loss(x_1=x0)
+        refined = self._sample_flow(
+            batch_size=x0.size(0),
+            device=x0.device,
+            num_steps=self.params.flow_matching.num_steps
+        )
+        logits = self.classifier(refined)
+        cls_loss = F.cross_entropy(logits, labels)
+        total_loss = flow_loss + cls_loss
 
-        attns = attns.unsqueeze(-1)
-        attns = (attns*attns.transpose(1,2)).unsqueeze(1)
-        noise_pred = self.model(x_batch, y_fusion, timesteps, patches, attns)
-
-        noise = noise.view(bz,np*np,-1).permute(0,2,1).reshape(bz,nc,np,np)
-        loss = self.diffusion_focal_loss(y0_aux,y_batch,noise_pred,noise)
-
-        self.log("train_loss",loss,prog_bar=False)
-        return {"loss":loss}
+        self.log("train_loss", total_loss, prog_bar=False)
+        return {"loss": total_loss}
 
     def on_validation_epoch_end(self):
         gt = torch.cat(self.gts)
@@ -199,28 +193,20 @@ class CoolSystem(pl.LightningModule):
 
 
     def validation_step(self, batch, batch_idx):
-        self.model.eval()
-        self.aux_model.eval()
+        self.feature_encoder.eval()
 
         
         x_batch, y_batch = batch
         y_batch, _ = cast_label_to_one_hot_and_prototype(y_batch, self.params)
-        y_batch = y_batch.cuda()
-        x_batch = x_batch.cuda()
-        with torch.no_grad():
-            y0_aux, y0_aux_global, y0_aux_local, patches, attns, attn_map = self.aux_model(x_batch)
-
-        bz, nc = y0_aux_global.size()
-        bz, np = attns.size()
-
-        
-        y0_cond = self.guided_prob_map(y0_aux_global,y0_aux_local,bz,nc,np)
-        yT = self.guided_prob_map(torch.rand_like(y0_aux_global),torch.rand_like(y0_aux_local),bz,nc,np)
-        attns = attns.unsqueeze(-1)
-        attns = (attns*attns.transpose(1,2)).unsqueeze(1)
-        y_pred = self.DiffSampler.sample_high_res(x_batch,yT,conditions=[y0_cond, patches, attns])
-        y_pred = y_pred.reshape(bz, nc, np*np)
-        y_pred = y_pred.mean(2)
+        y_batch = y_batch.to(self.device)
+        x_batch = x_batch.to(self.device)
+        refined = self._sample_flow(
+            batch_size=x_batch.size(0),
+            device=x_batch.device,
+            num_steps=self.params.flow_matching.num_steps
+        )
+        logits = self.classifier(refined)
+        y_pred = F.softmax(logits, dim=1)
         self.preds.append(y_pred)
         self.gts.append(y_batch)
 
@@ -281,13 +267,14 @@ def main():
         save_last=True
     )
     lr_monitor_callback = LearningRateMonitor(logging_interval='step')
+    precision = "16-mixed" if config.training.mixed_precision else 32
     trainer = pl.Trainer(
         check_val_every_n_epoch=10,
         num_sanity_val_steps=0,
         max_epochs=config.training.n_epochs,
         accelerator='gpu',
         devices=2,
-        precision=32,
+        precision=precision,
         logger=logger,
         strategy=DDPStrategy(find_unused_parameters=True),
         enable_progress_bar=False,
